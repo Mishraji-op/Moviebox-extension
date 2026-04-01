@@ -51,6 +51,51 @@ class MovieBoxProviderIN : MainAPI() {
     private val clientInfoHeader = """{"package_name":"com.community.oneroom","version_name":"3.0.05.0711.03","version_code":50020052,"os":"android","os_version":"16","device_id":"da2b99c821e6ea023e4be55b54d5f7d8","install_store":"ps","gaid":"d7578036d13336cc","brand":"google","model":"sdk_gphone64_x86_64","system_language":"en","net":"NETWORK_WIFI","region":"IN","timezone":"Asia/Calcutta","sp_code":""}"""
     private val debugLoadLinks = false
     private val debugThrowInUi = false
+    private val blockedSourceHostKeywords = listOf(
+        "fzmovies",
+        "vegamovies",
+        "effectivegate",
+        "gatecpm",
+        "adsterra",
+        "doubleclick"
+    )
+
+    private fun firstText(vararg values: String?): String? {
+        return values.firstOrNull { !it.isNullOrBlank() }
+    }
+
+    private fun isLikelyPlayableMediaUrl(rawUrl: String): Boolean {
+        if (rawUrl.isBlank()) return false
+        val parsed = Uri.parse(rawUrl)
+        val scheme = parsed.scheme?.lowercase() ?: return false
+        if (scheme != "http" && scheme != "https") return false
+
+        val host = (parsed.host ?: "").lowercase()
+        if (host.isBlank()) return false
+        if (blockedSourceHostKeywords.any { host.contains(it) }) return false
+
+        val url = rawUrl.lowercase()
+        val path = (parsed.path ?: "").lowercase()
+
+        if (path.endsWith(".html") || path.endsWith(".htm") || path.endsWith(".php")) return false
+        if (path.contains("/movie-") || path.contains("/tv-")) return false
+        if (url.contains("/redirect") || url.contains("effectivegate") || url.contains("gatecpm")) return false
+
+        val mediaHint = path.endsWith(".m3u8") ||
+            path.endsWith(".mp4") ||
+            path.endsWith(".mkv") ||
+            path.endsWith(".webm") ||
+            path.endsWith(".ts") ||
+            path.endsWith(".mpd") ||
+            path.contains("/resource/") ||
+            url.contains(".m3u8") ||
+            url.contains(".mp4") ||
+            url.contains("downloadurl=") ||
+            url.contains("resourceLink", true) ||
+            url.contains("sign=")
+
+        return mediaHint
+    }
 
     private fun shouldRetryHost(code: Int): Boolean {
         return code == 403 || code == 407 || code == 429 || code == 500 || code == 502 || code == 503 || code == 504
@@ -332,7 +377,21 @@ class MovieBoxProviderIN : MainAPI() {
 
         val title = data["title"]?.asText() ?: "Unknown"
         val description = data["description"]?.asText()
-        val coverUrl = data["cover"]?.get("url")?.asText()
+        val coverUrl = firstText(
+            data["cover"]?.get("url")?.asText(),
+            data["cover"]?.asText(),
+            data["poster"]?.get("url")?.asText(),
+            data["poster"]?.asText(),
+            data["stills"]?.get("url")?.asText(),
+            data["stills"]?.asText(),
+            data["trailer"]?.get("cover")?.get("url")?.asText(),
+            data["coverVertical"]?.get("url")?.asText(),
+            data["coverVertical"]?.asText(),
+            data["coverHorizontal"]?.get("url")?.asText(),
+            data["coverHorizontal"]?.asText(),
+            data["landscape"]?.get("url")?.asText(),
+            data["landscape"]?.asText()
+        )
         val subjectType = data["subjectType"]?.asInt() ?: 1
         val releaseDate = data["releaseDate"]?.asText()
         val year = try { releaseDate?.substring(0, 4)?.toIntOrNull() } catch (_: Exception) { null }
@@ -371,12 +430,17 @@ class MovieBoxProviderIN : MainAPI() {
                             val se = season["se"]?.asInt() ?: 1
                             val maxEp = season["maxEp"]?.asInt() ?: 1
                             for (ep in 1..maxEp) {
+                                val seasonCover = firstText(
+                                    season["cover"]?.get("url")?.asText(),
+                                    season["cover"]?.asText(),
+                                    coverUrl
+                                )
                                 episodes.add(
                                     newEpisode("$id|$se|$ep") {
                                         this.name = "S${se}E${ep}"
                                         this.season = se
                                         this.episode = ep
-                                        this.posterUrl = coverUrl
+                                        this.posterUrl = seasonCover
                                     }
                                 )
                             }
@@ -454,12 +518,25 @@ class MovieBoxProviderIN : MainAPI() {
         suspend fun emit(url: String, displayRes: String = "Unknown", cookie: String? = null): Boolean {
             if (url.isBlank() || !emitted.add(url)) return false
             if (url.startsWith("magnet:", true) || url.endsWith(".torrent", true)) return false
-            val isM3u8 = url.contains(".m3u8", true) || url.contains("m3u8", true)
+            val cleanUrl = url.trim().replace(" ", "%20")
+
+            if (!isLikelyPlayableMediaUrl(cleanUrl)) {
+                // Some catalogs expose only a web page URL; route it through extractors.
+                var extracted = false
+                runCatching {
+                    loadExtractor(cleanUrl, mainUrl, subtitleCallback) { link ->
+                        callback(link)
+                        extracted = true
+                    }
+                }
+                return extracted
+            }
+            val isM3u8 = cleanUrl.contains(".m3u8", true) || cleanUrl.contains("m3u8", true)
             callback.invoke(
                 newExtractorLink(
                     source = this.name,
                     name = "${this.name} ($displayRes)",
-                    url = url,
+                    url = cleanUrl,
                     type = if (isM3u8) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
                 ) {
                     this.quality = Qualities.Unknown.value
@@ -532,6 +609,17 @@ class MovieBoxProviderIN : MainAPI() {
                         }
                     }
                 }
+
+                val detailPage = dataNode?.get("detailUrl")?.asText()?.takeIf { it.isNotBlank() }
+                if (!detailPage.isNullOrBlank()) {
+                    if (emit(detailPage, "Page")) hasLinks = true
+                }
+
+                val trailerUrl = dataNode?.get("trailer")?.get("VideoAddress")?.get("url")?.asText()
+                    ?.takeIf { it.isNotBlank() }
+                if (!trailerUrl.isNullOrBlank()) {
+                    if (emit(trailerUrl, "Trailer")) hasLinks = true
+                }
             }
         }
 
@@ -551,6 +639,56 @@ class MovieBoxProviderIN : MainAPI() {
                     val chosenUrl = streamUrl
                     val ok = emit(chosenUrl, if (format.isNotBlank()) "$res/$format" else res, cookie)
                     if (ok) hasLinks = true
+                }
+            }
+        }
+
+        if (hasLinks) return true
+
+        // Final fallback for series titles: some catalogs expose links only through /resource.
+        val resourcePath = "/wefeed-mobile-bff/subject-api/resource?subjectId=$subjectId&se=$season&ep=$episode"
+        val resourceUrl = "$mainUrl$resourcePath"
+        val ts3 = System.currentTimeMillis()
+        val headers3 = mapOf(
+            "User-Agent" to userAgentHeader,
+            "Accept" to "application/json",
+            "Content-Type" to "application/json",
+            "Connection" to "keep-alive",
+            "X-Client-Token" to generateXClientToken(ts3),
+            "x-tr-signature" to generateXTrSignature(
+                "GET", "application/json", "application/json",
+                resourceUrl, null, false, ts3
+            ),
+            "X-Client-Info" to clientInfoHeader,
+            "X-Client-Status" to "0",
+            "X-Play-Mode" to "2"
+        )
+
+        val resourceResp = app.get(resourceUrl, headers = headers3)
+        val resourceBody = resourceResp.text
+        if (resourceBody.isNotBlank()) {
+            val resourceRoot = mapper.readTree(resourceBody)
+            val resourceData = resourceRoot["data"]
+
+            val direct = resourceData?.get("resourceLink")?.asText()?.takeIf { it.isNotBlank() }
+                ?: resourceData?.get("downloadUrl")?.asText()?.takeIf { it.isNotBlank() }
+            if (!direct.isNullOrBlank()) {
+                if (emit(direct, "Resource")) hasLinks = true
+            }
+
+            val resources = resourceData?.get("resources")
+            if (resources != null && resources.isArray) {
+                for (item in resources) {
+                    val link = item["downloadUrl"]?.asText()?.takeIf { it.isNotBlank() }
+                        ?: item["resourceLink"]?.asText()?.takeIf { it.isNotBlank() }
+                        ?: item["url"]?.asText()?.takeIf { it.isNotBlank() }
+                    if (!link.isNullOrBlank()) {
+                        val res = item["resolution"]?.asText()
+                            ?: item["resolutions"]?.asText()
+                            ?: item["title"]?.asText()
+                            ?: "Resource"
+                        if (emit(link, res)) hasLinks = true
+                    }
                 }
             }
         }
