@@ -1,0 +1,21 @@
+[
+    {
+        "url": "https://raw.githubusercontent.com/Mishraji-op/Moviebox-extension/builds/MovieBoxProviderIN.cs3",
+        "status": 1,
+        "version": 6,
+        "name": "MovieBoxProviderIN",
+        "internalName": "MovieBoxProviderIN",
+        "authors": [
+            "NivinCNC"
+        ],
+        "description": "Multi Language Movies and Series Provider (IN)",
+        "repositoryUrl": "https://github.com/Mishraji-op/Moviebox-extension",
+        "language": "ta",
+        "tvTypes": [
+            "Movie",
+            "TvSeries"
+        ],
+        "iconUrl": "https://raw.githubusercontent.com/Mishraji-op/Moviebox-extension/main/MovieBoxProviderIN/icon.png",
+        "apiVersion": 1
+    }
+]
