@@ -1,6 +1,7 @@
 package com.cncverse
 
 import android.net.Uri
+import android.util.Log
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
 import com.lagradost.cloudstream3.base64DecodeArray
@@ -48,6 +49,8 @@ class MovieBoxProviderIN : MainAPI() {
 
     private val userAgentHeader = "com.community.oneroom/50020052 (Linux; U; Android 16; en_IN; sdk_gphone64_x86_64; Build/BP22.250325.006; Cronet/133.0.6876.3)"
     private val clientInfoHeader = """{"package_name":"com.community.oneroom","version_name":"3.0.05.0711.03","version_code":50020052,"os":"android","os_version":"16","device_id":"da2b99c821e6ea023e4be55b54d5f7d8","install_store":"ps","gaid":"d7578036d13336cc","brand":"google","model":"sdk_gphone64_x86_64","system_language":"en","net":"NETWORK_WIFI","region":"IN","timezone":"Asia/Calcutta","sp_code":""}"""
+    private val debugLoadLinks = true
+    private val debugThrowInUi = false
 
     private fun shouldRetryHost(code: Int): Boolean {
         return code == 403 || code == 407 || code == 429 || code == 500 || code == 502 || code == 503 || code == 504
@@ -447,6 +450,11 @@ class MovieBoxProviderIN : MainAPI() {
             val parsedEpisode = if (parts.size > 2) parts[2].toIntOrNull() ?: 0 else 0
             val season = if (parsedSeason > 0) parsedSeason else 1
             val episode = if (parsedEpisode > 0) parsedEpisode else 1
+
+            if (debugLoadLinks) {
+                debugPlayInfoProbe(originalSubjectId, season, episode)
+            }
+
             val (_, subjectResponse) = signedGetWithFallback("/wefeed-mobile-bff/subject-api/get?subjectId=$originalSubjectId")
             val mapper = jacksonObjectMapper()
             val subjectIds = mutableListOf<Pair<String, String>>() // Pair of (subjectId, language)
@@ -715,6 +723,78 @@ class MovieBoxProviderIN : MainAPI() {
         } catch (e: Exception) {
             return false
         }
+    }
+
+    private suspend fun debugPlayInfoProbe(subjectId: String, season: Int, episode: Int) {
+        val mapper = jacksonObjectMapper()
+        val playPath = "/wefeed-mobile-bff/subject-api/play-info?subjectId=$subjectId&se=$season&ep=$episode"
+
+        Log.d("MBX", "=== LOAD LINKS START ===")
+        Log.d("MBX", "SubjectId: $subjectId")
+        Log.d("MBX", "Season: $season Episode: $episode")
+        Log.d("MBX", "MainUrl: $mainUrl")
+        Log.d("MBX", "Play path: $playPath")
+
+        for (host in hostPool) {
+            val fullUrl = "$host$playPath"
+            val ts = System.currentTimeMillis()
+            val headers = mapOf(
+                "User-Agent" to userAgentHeader,
+                "Accept" to "application/json",
+                "Content-Type" to "application/json",
+                "Connection" to "keep-alive",
+                "X-Client-Token" to generateXClientToken(ts),
+                "x-tr-signature" to generateXTrSignature("GET", "application/json", "application/json", fullUrl, null, false, ts),
+                "X-Client-Info" to clientInfoHeader,
+                "X-Client-Status" to "0",
+                "X-Play-Mode" to "2"
+            )
+
+            try {
+                val resp = app.get(fullUrl, headers = headers)
+                val body = resp.text
+                Log.d("MBX", "Host: $host")
+                Log.d("MBX", "Code: ${resp.code}")
+                Log.d("MBX", "Body: ${body.take(500)}")
+
+                if (resp.code == 200) {
+                    val root = mapper.readTree(body)
+                    val apiCode = root["code"]?.asInt()
+                    val message = root["message"]?.asText()
+                    val playData = root["data"]
+
+                    Log.d("MBX", "API Code: $apiCode")
+                    Log.d("MBX", "API Message: $message")
+                    if (playData != null && !playData.isNull) {
+                        val keys = playData.fieldNames().asSequence().toList()
+                        Log.d("MBX", "Data keys: $keys")
+                        val streams = playData["streams"]
+                        Log.d("MBX", "Streams: ${if (streams != null && streams.isArray) streams.size() else "NULL"}")
+                        if (streams != null && streams.isArray) {
+                            for (i in 0 until streams.size()) {
+                                val s = streams[i]
+                                Log.d("MBX", "Stream[$i] url: ${s["url"]?.asText()?.take(100)}")
+                                Log.d("MBX", "Stream[$i] format: ${s["format"]?.asText()}")
+                                Log.d("MBX", "Stream[$i] res: ${s["resolutions"]?.asText()}")
+                            }
+                        }
+                        val detectors = playData["resourceDetectors"]
+                        Log.d("MBX", "ResourceDetectors: ${if (detectors != null && detectors.isArray) detectors.size() else "NULL"}")
+                    } else {
+                        Log.d("MBX", "Data is NULL")
+                    }
+
+                    if (debugThrowInUi) {
+                        throw ErrorLoadingException("DEBUG - Code: ${resp.code} | Body: ${body.take(300)}")
+                    }
+                    break
+                }
+            } catch (e: Exception) {
+                Log.d("MBX", "Host $host error: ${e.message}")
+            }
+        }
+
+        Log.d("MBX", "=== LOAD LINKS END ===")
     }
 }
 
