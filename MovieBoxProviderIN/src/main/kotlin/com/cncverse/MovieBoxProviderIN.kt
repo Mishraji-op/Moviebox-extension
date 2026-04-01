@@ -444,12 +444,113 @@ class MovieBoxProviderIN : MainAPI() {
             else {
                 parts[0]
             }
-            val season = if (parts.size > 1) parts[1].toIntOrNull() ?: 0 else 0
-            val episode = if (parts.size > 2) parts[2].toIntOrNull() ?: 0 else 0
+            val parsedSeason = if (parts.size > 1) parts[1].toIntOrNull() ?: 0 else 0
+            val parsedEpisode = if (parts.size > 2) parts[2].toIntOrNull() ?: 0 else 0
+            val season = if (parsedSeason > 0) parsedSeason else 1
+            val episode = if (parsedEpisode > 0) parsedEpisode else 1
             val (_, subjectResponse) = signedGetWithFallback("/wefeed-mobile-bff/subject-api/get?subjectId=$originalSubjectId")
             val mapper = jacksonObjectMapper()
             val subjectIds = mutableListOf<Pair<String, String>>() // Pair of (subjectId, language)
             var originalLanguageName = "Original"
+            val visitedUrls = mutableSetOf<String>()
+
+            suspend fun emitLink(
+                sourceName: String,
+                streamUrl: String,
+                language: String,
+                resolution: String,
+                refererBase: String,
+                signCookie: String? = null
+            ) {
+                if (streamUrl.isBlank() || !visitedUrls.add(streamUrl)) return
+                callback.invoke(
+                    newExtractorLink(
+                        source = name,
+                        name = if (resolution.isNotBlank()) "$name ($language - $resolution)" else "$name ($language)",
+                        url = streamUrl,
+                        type = when {
+                            streamUrl.startsWith("magnet:", ignoreCase = true) -> ExtractorLinkType.MAGNET
+                            streamUrl.substringAfterLast('.', "").equals("mpd", ignoreCase = true) -> ExtractorLinkType.DASH
+                            streamUrl.substringAfterLast('.', "").equals("torrent", ignoreCase = true) -> ExtractorLinkType.TORRENT
+                            sourceName.equals("HLS", ignoreCase = true) || streamUrl.substringAfterLast('.', "").equals("m3u8", ignoreCase = true) -> ExtractorLinkType.M3U8
+                            else -> ExtractorLinkType.VIDEO
+                        }
+                    ) {
+                        this.headers = mapOf("Referer" to refererBase)
+                        this.quality = Qualities.Unknown.value
+                        if (!signCookie.isNullOrBlank()) {
+                            this.headers = this.headers + mapOf("Cookie" to signCookie)
+                        }
+                    }
+                )
+            }
+
+            suspend fun extractFallbackLinksFromSubject(
+                subjectData: JsonNode?,
+                language: String,
+                refererBase: String
+            ): Boolean {
+                var emitted = false
+                val detectors = subjectData?.get("resourceDetectors")
+                if (detectors != null && detectors.isArray) {
+                    for (detector in detectors) {
+                        val detectorLink = detector["resourceLink"]?.asText()?.takeIf { it.isNotBlank() }
+                            ?: detector["downloadUrl"]?.asText()?.takeIf { it.isNotBlank() }
+                            ?: detector["sourceUrl"]?.asText()?.takeIf { it.isNotBlank() }
+                        if (!detectorLink.isNullOrBlank()) {
+                            emitLink(
+                                sourceName = detector["format"]?.asText() ?: "",
+                                streamUrl = detectorLink,
+                                language = language,
+                                resolution = detector["resolution"]?.asText() ?: detector["title"]?.asText() ?: "Resource",
+                                refererBase = refererBase
+                            )
+                            emitted = true
+                        }
+
+                        val resolutionList = detector["resolutionList"]
+                        if (resolutionList != null && resolutionList.isArray) {
+                            for (item in resolutionList) {
+                                val link = item["downloadUrl"]?.asText()?.takeIf { it.isNotBlank() }
+                                    ?: item["resourceLink"]?.asText()?.takeIf { it.isNotBlank() }
+                                    ?: item["sourceUrl"]?.asText()?.takeIf { it.isNotBlank() }
+                                if (!link.isNullOrBlank()) {
+                                    emitLink(
+                                        sourceName = item["format"]?.asText() ?: "",
+                                        streamUrl = link,
+                                        language = language,
+                                        resolution = item["resolutions"]?.asText()
+                                            ?: item["resolution"]?.asText()
+                                            ?: item["title"]?.asText()
+                                            ?: "Resource",
+                                        refererBase = refererBase
+                                    )
+                                    emitted = true
+                                }
+
+                                val captions = item["extCaptions"]
+                                if (captions != null && captions.isArray) {
+                                    for (caption in captions) {
+                                        val captionUrl = caption["url"]?.asText() ?: continue
+                                        val lang = caption["language"]?.asText()
+                                            ?: caption["lanName"]?.asText()
+                                            ?: caption["lan"]?.asText()
+                                            ?: "Unknown"
+                                        subtitleCallback.invoke(
+                                            SubtitleFile(
+                                                url = captionUrl,
+                                                lang = "$lang ($language)"
+                                            )
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                return emitted
+            }
+
             if (subjectResponse.code == 200) {
                 val subjectResponseBody = subjectResponse.body?.string()
                 if (subjectResponseBody != null) {
@@ -480,8 +581,9 @@ class MovieBoxProviderIN : MainAPI() {
             // Process each subjectId (including dubs)
             for ((subjectId, language) in subjectIds) {
                 try {
+                    var emittedFromPlayInfo = false
                     val (activeBaseUrl, response) = signedGetWithFallback(
-                        "/wefeed-mobile-bff/subject-api/play-info?subjectId=$subjectId&se=$season&ep=$episode",
+                        "/wefeed-mobile-bff/subject-api/play-info?subjectId=$subjectId&se=$season&ep=$episode&host=$mainUrl",
                         includePlayMode = true
                     )
                     if (response.code == 200) {
@@ -496,36 +598,22 @@ class MovieBoxProviderIN : MainAPI() {
                                     val streamUrl = stream["url"]?.asText() ?: continue
                                     val format = stream["format"]?.asText() ?: ""
                                     val resolutions = stream["resolutions"]?.asText() ?: ""
-                                    val codecName = stream["codecName"]?.asText() ?: "h264"
                                     val signCookieRaw = stream["signCookie"]?.asText()
                                     val signCookie = if (signCookieRaw.isNullOrEmpty()) null else signCookieRaw
-                                    val duration = stream["duration"]?.asInt()
                                     val id = stream["id"]?.asText() ?: "$subjectId|$season|$episode"
-                                    
-                                    callback.invoke(
-                                        newExtractorLink(
-                                            source = name,
-                                            name = "$name ($language - $resolutions)",
-                                            url = streamUrl,
-                                            type = when {
-                                                streamUrl.startsWith("magnet:", ignoreCase = true) -> ExtractorLinkType.MAGNET
-                                                streamUrl.substringAfterLast('.', "").equals("mpd", ignoreCase = true) -> ExtractorLinkType.DASH
-                                                streamUrl.substringAfterLast('.', "").equals("torrent", ignoreCase = true) -> ExtractorLinkType.TORRENT
-                                                format.equals("HLS", ignoreCase = true) || streamUrl.substringAfterLast('.', "").equals("m3u8", ignoreCase = true) -> ExtractorLinkType.M3U8
-                                                else -> ExtractorLinkType.VIDEO
-                                            }
-                                        ) {
-                                            this.headers = mapOf("Referer" to activeBaseUrl)
-                                            this.quality = Qualities.Unknown.value
-                                            if (signCookie != null) {
-                                                this.headers = this.headers + mapOf("Cookie" to signCookie)
-                                            }
-                                        }
+                                    emitLink(
+                                        sourceName = format,
+                                        streamUrl = streamUrl,
+                                        language = language,
+                                        resolution = resolutions,
+                                        refererBase = activeBaseUrl,
+                                        signCookie = signCookie
                                     )
                                     hasAnyLinks = true
+                                    emittedFromPlayInfo = true
 
                                     val (_, subResponse) = signedGetWithFallback(
-                                        "/wefeed-mobile-bff/subject-api/get-stream-captions?subjectId=$subjectId&streamId=$id",
+                                        "/wefeed-mobile-bff/subject-api/get-stream-captions?subjectId=$subjectId&streamId=$id&host=$activeBaseUrl",
                                         accept = "",
                                         contentType = ""
                                     )
@@ -554,7 +642,7 @@ class MovieBoxProviderIN : MainAPI() {
                                         
 
                                     val (_, subResponse1) = signedGetWithFallback(
-                                        "/wefeed-mobile-bff/subject-api/get-ext-captions?subjectId=$subjectId&resourceId=$id&episode=0",
+                                                                                "/wefeed-mobile-bff/subject-api/get-ext-captions?subjectId=$subjectId&resourceId=$id&episode=$episode&host=$activeBaseUrl",
                                         accept = "",
                                         contentType = ""
                                     )
@@ -584,8 +672,41 @@ class MovieBoxProviderIN : MainAPI() {
                                     
                                 }
                             }
+
+                                if (!emittedFromPlayInfo) {
+                                    val fallbackFromSubject = extractFallbackLinksFromSubject(
+                                        subjectData = playData,
+                                        language = language,
+                                        refererBase = activeBaseUrl
+                                    )
+                                    if (fallbackFromSubject) {
+                                        hasAnyLinks = true
+                                    }
+                                }
                         }
                     }
+
+                        if (!emittedFromPlayInfo) {
+                            val (_, resourceResponse) = signedGetWithFallback(
+                                "/wefeed-mobile-bff/subject-api/resource?subjectId=$subjectId&page=1&perPage=8&all=0&startPosition=1&endPosition=1&pagerMode=0&resolution=0&se=$season&epFrom=$episode&epTo=$episode&host=$activeBaseUrl",
+                                includePlayMode = true
+                            )
+                            if (resourceResponse.code == 200) {
+                                val resourceBody = resourceResponse.body?.string()
+                                if (!resourceBody.isNullOrBlank()) {
+                                    val resourceRoot = mapper.readTree(resourceBody)
+                                    val resourceData = resourceRoot["data"]
+                                    val fallbackFromResource = extractFallbackLinksFromSubject(
+                                        subjectData = resourceData,
+                                        language = language,
+                                        refererBase = activeBaseUrl
+                                    )
+                                    if (fallbackFromResource) {
+                                        hasAnyLinks = true
+                                    }
+                                }
+                            }
+                        }
                 } catch (e: Exception) {
                     continue
                 }
