@@ -49,7 +49,7 @@ class MovieBoxProviderIN : MainAPI() {
 
     private val userAgentHeader = "com.community.oneroom/50020052 (Linux; U; Android 16; en_IN; sdk_gphone64_x86_64; Build/BP22.250325.006; Cronet/133.0.6876.3)"
     private val clientInfoHeader = """{"package_name":"com.community.oneroom","version_name":"3.0.05.0711.03","version_code":50020052,"os":"android","os_version":"16","device_id":"da2b99c821e6ea023e4be55b54d5f7d8","install_store":"ps","gaid":"d7578036d13336cc","brand":"google","model":"sdk_gphone64_x86_64","system_language":"en","net":"NETWORK_WIFI","region":"IN","timezone":"Asia/Calcutta","sp_code":""}"""
-    private val debugLoadLinks = true
+    private val debugLoadLinks = false
     private val debugThrowInUi = false
 
     private fun shouldRetryHost(code: Int): Boolean {
