@@ -552,7 +552,7 @@ class MovieBoxProviderIN : MainAPI() {
 
             if (subjectResponse.code == 200) {
                 val subjectResponseBody = subjectResponse.text
-                if (subjectResponseBody != null) {
+                if (subjectResponseBody.isNotBlank()) {
                     val subjectRoot = mapper.readTree(subjectResponseBody)
                     val subjectData = subjectRoot["data"]
                     val dubs = subjectData?.get("dubs")
@@ -579,15 +579,17 @@ class MovieBoxProviderIN : MainAPI() {
             
             // Process each subjectId (including dubs)
             for ((subjectId, language) in subjectIds) {
+                var emittedFromPlayInfo = false
+                var activeBaseUrl = mainUrl
                 try {
-                    var emittedFromPlayInfo = false
-                    val (activeBaseUrl, response) = signedGetWithFallback(
+                    val (resolvedBaseUrl, response) = signedGetWithFallback(
                         "/wefeed-mobile-bff/subject-api/play-info?subjectId=$subjectId&se=$season&ep=$episode",
                         includePlayMode = true
                     )
+                    activeBaseUrl = resolvedBaseUrl
                     if (response.code == 200) {
                         val responseBody = response.text
-                        if (responseBody != null) {
+                        if (responseBody.isNotBlank()) {
                             val root = mapper.readTree(responseBody)
                             val playData = root["data"]
                             // Handle the new API response format with streams
@@ -681,29 +683,30 @@ class MovieBoxProviderIN : MainAPI() {
                         }
                     }
 
-                        if (!emittedFromPlayInfo) {
-                            val (_, resourceResponse) = signedGetWithFallback(
-                                "/wefeed-mobile-bff/subject-api/resource?subjectId=$subjectId&page=1&perPage=8&all=0&startPosition=1&endPosition=1&pagerMode=0&resolution=0&se=$season&epFrom=$episode&epTo=$episode",
-                                includePlayMode = true
+                } catch (e: Exception) {
+                    // Continue to resource fallback using the last known active base.
+                }
+
+                if (!emittedFromPlayInfo) {
+                    val (_, resourceResponse) = signedGetWithFallback(
+                        "/wefeed-mobile-bff/subject-api/resource?subjectId=$subjectId&page=1&perPage=8&all=0&startPosition=1&endPosition=1&pagerMode=0&resolution=0&se=$season&epFrom=$episode&epTo=$episode",
+                        includePlayMode = true
+                    )
+                    if (resourceResponse.code == 200) {
+                        val resourceBody = resourceResponse.text
+                        if (!resourceBody.isNullOrBlank()) {
+                            val resourceRoot = mapper.readTree(resourceBody)
+                            val resourceData = resourceRoot["data"]
+                            val fallbackFromResource = extractFallbackLinksFromSubject(
+                                subjectData = resourceData,
+                                language = language,
+                                refererBase = activeBaseUrl
                             )
-                            if (resourceResponse.code == 200) {
-                                val resourceBody = resourceResponse.text
-                                if (!resourceBody.isNullOrBlank()) {
-                                    val resourceRoot = mapper.readTree(resourceBody)
-                                    val resourceData = resourceRoot["data"]
-                                    val fallbackFromResource = extractFallbackLinksFromSubject(
-                                        subjectData = resourceData,
-                                        language = language,
-                                        refererBase = activeBaseUrl
-                                    )
-                                    if (fallbackFromResource) {
-                                        hasAnyLinks = true
-                                    }
-                                }
+                            if (fallbackFromResource) {
+                                hasAnyLinks = true
                             }
                         }
-                } catch (e: Exception) {
-                    continue
+                    }
                 }
             }
             
