@@ -461,6 +461,18 @@ class MovieBoxProviderIN : MainAPI() {
             var originalLanguageName = "Original"
             val visitedUrls = mutableSetOf<String>()
 
+            fun qualityFromResolution(resolution: String): Int {
+                val normalized = resolution.lowercase()
+                return when {
+                    normalized.contains("4k") || normalized.contains("2160") -> Qualities.P1080.value
+                    normalized.contains("1080") -> Qualities.P1080.value
+                    normalized.contains("720") -> Qualities.P720.value
+                    normalized.contains("480") -> Qualities.P480.value
+                    normalized.contains("360") -> Qualities.P360.value
+                    else -> Qualities.Unknown.value
+                }
+            }
+
             suspend fun emitLink(
                 sourceName: String,
                 streamUrl: String,
@@ -470,21 +482,34 @@ class MovieBoxProviderIN : MainAPI() {
                 signCookie: String? = null
             ) {
                 if (streamUrl.isBlank() || !visitedUrls.add(streamUrl)) return
+                if (streamUrl.startsWith("magnet:", ignoreCase = true) || streamUrl.endsWith(".torrent", ignoreCase = true)) {
+                    Log.d("MBX", "Skipping non-playable stream URL: ${streamUrl.take(120)}")
+                    return
+                }
+
+                val isHls = sourceName.equals("HLS", ignoreCase = true)
+                    || streamUrl.contains(".m3u8", ignoreCase = true)
+                    || streamUrl.contains("m3u8", ignoreCase = true)
+
                 callback.invoke(
                     newExtractorLink(
                         source = name,
                         name = if (resolution.isNotBlank()) "$name ($language - $resolution)" else "$name ($language)",
                         url = streamUrl,
                         type = when {
-                            streamUrl.startsWith("magnet:", ignoreCase = true) -> ExtractorLinkType.MAGNET
                             streamUrl.substringAfterLast('.', "").equals("mpd", ignoreCase = true) -> ExtractorLinkType.DASH
-                            streamUrl.substringAfterLast('.', "").equals("torrent", ignoreCase = true) -> ExtractorLinkType.TORRENT
-                            sourceName.equals("HLS", ignoreCase = true) || streamUrl.substringAfterLast('.', "").equals("m3u8", ignoreCase = true) -> ExtractorLinkType.M3U8
+                            isHls -> ExtractorLinkType.M3U8
                             else -> ExtractorLinkType.VIDEO
                         }
                     ) {
-                        this.headers = mapOf("Referer" to refererBase)
-                        this.quality = Qualities.Unknown.value
+                        this.headers = mapOf(
+                            "User-Agent" to userAgentHeader,
+                            "Referer" to refererBase,
+                            "Origin" to refererBase,
+                            "Accept" to "*/*",
+                            "Connection" to "keep-alive"
+                        )
+                        this.quality = qualityFromResolution(resolution)
                         if (!signCookie.isNullOrBlank()) {
                             this.headers = this.headers + mapOf("Cookie" to signCookie)
                         }
@@ -610,6 +635,15 @@ class MovieBoxProviderIN : MainAPI() {
                                     val signCookieRaw = stream["signCookie"]?.asText()
                                     val signCookie = if (signCookieRaw.isNullOrEmpty()) null else signCookieRaw
                                     val id = stream["id"]?.asText() ?: "$subjectId|$season|$episode"
+
+                                    Log.d("MBX", "=== STREAM LINK ===")
+                                    Log.d("MBX", "URL: $streamUrl")
+                                    Log.d("MBX", "Format: $format")
+                                    Log.d("MBX", "Resolution: $resolutions")
+                                    Log.d("MBX", "SignCookie: ${signCookie?.take(300)}")
+                                    Log.d("MBX", "isM3u8: ${format.equals("HLS", true) || streamUrl.contains(".m3u8", true) || streamUrl.contains("m3u8", true)}")
+                                    Log.d("MBX", "===================")
+
                                     emitLink(
                                         sourceName = format,
                                         streamUrl = streamUrl,
