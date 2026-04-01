@@ -445,44 +445,107 @@ class MovieBoxProviderIN : MainAPI() {
 
         val resp = app.get(fullUrl, headers = headers)
         val body = resp.text
-        if (body.isBlank()) return false
-
         val mapper = jacksonObjectMapper()
-        val root = mapper.readTree(body)
-        val playData = root["data"] ?: return false
-        val streams = playData["streams"] ?: return false
-
+        val emitted = mutableSetOf<String>()
         var hasLinks = false
-        if (streams.isArray) {
-            for (stream in streams) {
-                val streamUrl = stream["url"]?.asText() ?: continue
-                if (streamUrl.isBlank()) continue
 
-                val format = stream["format"]?.asText() ?: ""
-                val res = stream["resolutions"]?.asText() ?: ""
-                val cookie = stream["signCookie"]?.asText()?.takeIf { it.isNotBlank() }
+        suspend fun emit(url: String, displayRes: String = "Unknown", cookie: String? = null): Boolean {
+            if (url.isBlank() || !emitted.add(url)) return false
+            if (url.startsWith("magnet:", true) || url.endsWith(".torrent", true)) return false
+            val isM3u8 = url.contains(".m3u8", true) || url.contains("m3u8", true)
+            callback.invoke(
+                newExtractorLink(
+                    source = this.name,
+                    name = "${this.name} ($displayRes)",
+                    url = url,
+                    type = if (isM3u8) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+                ) {
+                    this.quality = Qualities.Unknown.value
+                    this.headers = mutableMapOf(
+                        "User-Agent" to userAgentHeader,
+                        "Referer" to mainUrl,
+                        "Origin" to mainUrl,
+                        "Accept" to "*/*"
+                    ).apply {
+                        if (!cookie.isNullOrBlank()) put("Cookie", cookie)
+                    }
+                }
+            )
+            return true
+        }
 
-                callback.invoke(
-                    newExtractorLink(
-                        source = this.name,
-                        name = "${this.name} ($res)",
-                        url = streamUrl,
-                        type = if (format.equals("HLS", true) || streamUrl.contains(".m3u8", true)) {
-                            ExtractorLinkType.M3U8
-                        } else {
-                            ExtractorLinkType.VIDEO
+        if (body.isNotBlank()) {
+            val root = mapper.readTree(body)
+            val playData = root["data"]
+            val streams = playData?.get("streams")
+            if (streams != null && streams.isArray) {
+                for (stream in streams) {
+                    val streamUrl = stream["url"]?.asText() ?: continue
+                    val format = stream["format"]?.asText() ?: ""
+                    val res = stream["resolutions"]?.asText() ?: "Unknown"
+                    val cookie = stream["signCookie"]?.asText()?.takeIf { it.isNotBlank() }
+                    val chosenUrl = streamUrl
+                    val ok = emit(chosenUrl, if (format.isNotBlank()) "$res/$format" else res, cookie)
+                    if (ok) hasLinks = true
+                }
+            }
+        }
+
+        if (!hasLinks) {
+            val detailsPath = "/wefeed-mobile-bff/subject-api/get?subjectId=$subjectId"
+            val detailsUrl = "$mainUrl$detailsPath"
+            val ts2 = System.currentTimeMillis()
+            val headers2 = mapOf(
+                "User-Agent" to userAgentHeader,
+                "Accept" to "application/json",
+                "Content-Type" to "application/json",
+                "Connection" to "keep-alive",
+                "X-Client-Token" to generateXClientToken(ts2),
+                "x-tr-signature" to generateXTrSignature(
+                    "GET", "application/json", "application/json",
+                    detailsUrl, null, false, ts2
+                ),
+                "X-Client-Info" to clientInfoHeader,
+                "X-Client-Status" to "0",
+                "X-Play-Mode" to "2"
+            )
+
+            val detailsResp = app.get(detailsUrl, headers = headers2)
+            val detailsBody = detailsResp.text
+            if (detailsBody.isNotBlank()) {
+                val detailsRoot = mapper.readTree(detailsBody)
+                val dataNode = detailsRoot["data"]
+                val detectors = dataNode?.get("resourceDetectors")
+                if (detectors != null && detectors.isArray) {
+                    for (det in detectors) {
+                        val direct = det["resourceLink"]?.asText()?.takeIf { it.isNotBlank() }
+                            ?: det["downloadUrl"]?.asText()?.takeIf { it.isNotBlank() }
+                        if (!direct.isNullOrBlank()) {
+                            if (emit(direct, det["resolution"]?.asText() ?: "Resource")) hasLinks = true
                         }
-                    ) {
-                        this.quality = Qualities.Unknown.value
-                        this.headers = mutableMapOf(
-                            "User-Agent" to userAgentHeader,
-                            "Referer" to mainUrl
-                        ).apply {
-                            if (cookie != null) put("Cookie", cookie)
+
+                        val resolutionList = det["resolutionList"]
+                        if (resolutionList != null && resolutionList.isArray) {
+                            for (item in resolutionList) {
+                                val itemSe = item["se"]?.asInt()
+                                val itemEp = item["ep"]?.asInt()
+                                if (itemSe != null && itemSe > 0 && itemSe != season) continue
+                                if (itemEp != null && itemEp > 0 && itemEp != episode) continue
+
+                                val link = item["downloadUrl"]?.asText()?.takeIf { it.isNotBlank() }
+                                    ?: item["resourceLink"]?.asText()?.takeIf { it.isNotBlank() }
+                                    ?: item["sourceUrl"]?.asText()?.takeIf { it.isNotBlank() }
+                                if (!link.isNullOrBlank()) {
+                                    val res = item["resolutions"]?.asText()
+                                        ?: item["resolution"]?.asText()
+                                        ?: item["title"]?.asText()
+                                        ?: "Resource"
+                                    if (emit(link, res)) hasLinks = true
+                                }
+                            }
                         }
                     }
-                )
-                hasLinks = true
+                }
             }
         }
 
