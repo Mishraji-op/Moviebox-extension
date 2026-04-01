@@ -482,6 +482,7 @@ class MovieBoxProviderIN : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         val parts = data.split("|")
+        val isSeriesRequest = parts.size > 1
         val subjectId = when {
             parts[0].contains("get?subjectId") -> Uri.parse(parts[0]).getQueryParameter("subjectId") ?: parts[0]
             parts[0].contains("/") -> parts[0].substringAfterLast('/')
@@ -519,6 +520,15 @@ class MovieBoxProviderIN : MainAPI() {
             if (url.isBlank() || !emitted.add(url)) return false
             if (url.startsWith("magnet:", true) || url.endsWith(".torrent", true)) return false
             val cleanUrl = url.trim().replace(" ", "%20")
+
+            // Series payloads sometimes include trailer clips (~1-2 minutes); never use them as episode links.
+            if (isSeriesRequest && (
+                    cleanUrl.contains("/media/vone/", true) ||
+                    cleanUrl.contains("-ld.mp4", true) ||
+                    cleanUrl.contains("/trailer/", true)
+                )) {
+                return false
+            }
 
             if (!isLikelyPlayableMediaUrl(cleanUrl)) {
                 // Some catalogs expose only a web page URL; route it through extractors.
@@ -610,15 +620,18 @@ class MovieBoxProviderIN : MainAPI() {
                     }
                 }
 
-                val detailPage = dataNode?.get("detailUrl")?.asText()?.takeIf { it.isNotBlank() }
-                if (!detailPage.isNullOrBlank()) {
-                    if (emit(detailPage, "Page")) hasLinks = true
-                }
+                // Generic detail/trailer URLs are not episode-specific and can cause short clip playback for series.
+                if (!isSeriesRequest) {
+                    val detailPage = dataNode?.get("detailUrl")?.asText()?.takeIf { it.isNotBlank() }
+                    if (!detailPage.isNullOrBlank()) {
+                        if (emit(detailPage, "Page")) hasLinks = true
+                    }
 
-                val trailerUrl = dataNode?.get("trailer")?.get("VideoAddress")?.get("url")?.asText()
-                    ?.takeIf { it.isNotBlank() }
-                if (!trailerUrl.isNullOrBlank()) {
-                    if (emit(trailerUrl, "Trailer")) hasLinks = true
+                    val trailerUrl = dataNode?.get("trailer")?.get("VideoAddress")?.get("url")?.asText()
+                        ?.takeIf { it.isNotBlank() }
+                    if (!trailerUrl.isNullOrBlank()) {
+                        if (emit(trailerUrl, "Trailer")) hasLinks = true
+                    }
                 }
             }
         }
