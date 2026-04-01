@@ -436,349 +436,40 @@ class MovieBoxProviderIN : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        try {
-            val parts = data.split("|")
-            val originalSubjectId = if (parts[0].contains("get?subjectId")) {
-                Uri.parse(parts[0]).getQueryParameter("subjectId") ?: parts[0].substringAfterLast('/')
-            } else if(parts[0].contains("/")) {
-                parts[0].substringAfterLast('/')
-            }
-            else {
-                parts[0]
-            }
-            val parsedSeason = if (parts.size > 1) parts[1].toIntOrNull() ?: 0 else 0
-            val parsedEpisode = if (parts.size > 2) parts[2].toIntOrNull() ?: 0 else 0
-            val season = if (parsedSeason > 0) parsedSeason else 1
-            val episode = if (parsedEpisode > 0) parsedEpisode else 1
-
-            if (debugLoadLinks) {
-                debugPlayInfoProbe(originalSubjectId, season, episode)
-            }
-
-            val (_, subjectResponse) = signedGetWithFallback("/wefeed-mobile-bff/subject-api/get?subjectId=$originalSubjectId")
-            val mapper = jacksonObjectMapper()
-            val subjectIds = mutableListOf<Pair<String, String>>() // Pair of (subjectId, language)
-            var originalLanguageName = "Original"
-            val visitedUrls = mutableSetOf<String>()
-
-            fun qualityFromResolution(resolution: String): Int {
-                val normalized = resolution.lowercase()
-                return when {
-                    normalized.contains("4k") || normalized.contains("2160") -> Qualities.P1080.value
-                    normalized.contains("1080") -> Qualities.P1080.value
-                    normalized.contains("720") -> Qualities.P720.value
-                    normalized.contains("480") -> Qualities.P480.value
-                    normalized.contains("360") -> Qualities.P360.value
-                    else -> Qualities.Unknown.value
-                }
-            }
-
-            suspend fun emitLink(
-                sourceName: String,
-                streamUrl: String,
-                language: String,
-                resolution: String,
-                refererBase: String,
-                signCookie: String? = null
-            ): Boolean {
-                if (streamUrl.isBlank() || !visitedUrls.add(streamUrl)) return false
-                if (streamUrl.startsWith("magnet:", ignoreCase = true) || streamUrl.endsWith(".torrent", ignoreCase = true)) {
-                    Log.d("MBX", "Skipping non-playable stream URL: ${streamUrl.take(120)}")
-                    return false
-                }
-
-                val isHls = sourceName.equals("HLS", ignoreCase = true)
-                    || streamUrl.contains(".m3u8", ignoreCase = true)
-                    || streamUrl.contains("m3u8", ignoreCase = true)
-                    || streamUrl.contains("/hls/", ignoreCase = true)
-                val isDash = sourceName.equals("DASH", ignoreCase = true)
-                    || streamUrl.contains(".mpd", ignoreCase = true)
-
-                val streamHeaders = mutableMapOf(
-                    "User-Agent" to userAgentHeader,
-                    "Referer" to refererBase,
-                    "Origin" to refererBase,
-                    "Accept" to "*/*",
-                    "Connection" to "keep-alive"
-                )
-                if (!signCookie.isNullOrBlank()) {
-                    streamHeaders["Cookie"] = signCookie
-                }
-
-                val actualUrl = if (streamUrl.contains("redirect", ignoreCase = true) || (!isHls && !isDash)) {
-                    try {
-                        val redirectResp = app.get(streamUrl, headers = streamHeaders, allowRedirects = false)
-                        redirectResp.headers["Location"] ?: streamUrl
-                    } catch (_: Exception) {
-                        streamUrl
-                    }
-                } else {
-                    streamUrl
-                }
-
-                callback.invoke(
-                    newExtractorLink(
-                        source = this.name,
-                        name = if (resolution.isNotBlank()) "${this.name} ($language - $resolution)" else "${this.name} ($language)",
-                        url = actualUrl,
-                        type = when {
-                            isDash -> ExtractorLinkType.DASH
-                            isHls -> ExtractorLinkType.M3U8
-                            else -> ExtractorLinkType.VIDEO
-                        }
-                    ) {
-                        this.headers = streamHeaders
-                        this.quality = qualityFromResolution(resolution)
-                    }
-                )
-                Log.d("MBX", "Actual URL: $actualUrl")
-                return true
-            }
-
-            suspend fun extractFallbackLinksFromSubject(
-                subjectData: JsonNode?,
-                language: String,
-                refererBase: String
-            ): Boolean {
-                var emitted = false
-                val detectors = subjectData?.get("resourceDetectors")
-                if (detectors != null && detectors.isArray) {
-                    for (detector in detectors) {
-                        val detectorLink = detector["resourceLink"]?.asText()?.takeIf { it.isNotBlank() }
-                            ?: detector["downloadUrl"]?.asText()?.takeIf { it.isNotBlank() }
-                            ?: detector["sourceUrl"]?.asText()?.takeIf { it.isNotBlank() }
-                        if (!detectorLink.isNullOrBlank()) {
-                            emitLink(
-                                sourceName = detector["format"]?.asText() ?: "",
-                                streamUrl = detectorLink,
-                                language = language,
-                                resolution = detector["resolution"]?.asText() ?: detector["title"]?.asText() ?: "Resource",
-                                refererBase = refererBase
-                            )
-                            emitted = true
-                        }
-
-                        val resolutionList = detector["resolutionList"]
-                        if (resolutionList != null && resolutionList.isArray) {
-                            for (item in resolutionList) {
-                                val link = item["downloadUrl"]?.asText()?.takeIf { it.isNotBlank() }
-                                    ?: item["resourceLink"]?.asText()?.takeIf { it.isNotBlank() }
-                                    ?: item["sourceUrl"]?.asText()?.takeIf { it.isNotBlank() }
-                                if (!link.isNullOrBlank()) {
-                                    emitLink(
-                                        sourceName = item["format"]?.asText() ?: "",
-                                        streamUrl = link,
-                                        language = language,
-                                        resolution = item["resolutions"]?.asText()
-                                            ?: item["resolution"]?.asText()
-                                            ?: item["title"]?.asText()
-                                            ?: "Resource",
-                                        refererBase = refererBase
-                                    )
-                                    emitted = true
-                                }
-
-                                val captions = item["extCaptions"]
-                                if (captions != null && captions.isArray) {
-                                    for (caption in captions) {
-                                        val captionUrl = caption["url"]?.asText() ?: continue
-                                        val lang = caption["language"]?.asText()
-                                            ?: caption["lanName"]?.asText()
-                                            ?: caption["lan"]?.asText()
-                                            ?: "Unknown"
-                                        subtitleCallback.invoke(
-                                            SubtitleFile(
-                                                url = captionUrl,
-                                                lang = "$lang ($language)"
-                                            )
-                                        )
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                return emitted
-            }
-
-            if (subjectResponse.code == 200) {
-                val subjectResponseBody = subjectResponse.text
-                if (subjectResponseBody.isNotBlank()) {
-                    val subjectRoot = mapper.readTree(subjectResponseBody)
-                    val subjectData = subjectRoot["data"]
-                    val dubs = subjectData?.get("dubs")
-                    if (dubs != null && dubs.isArray) {
-                        for (dub in dubs) {
-                            val dubSubjectId = dub["subjectId"]?.asText()
-                            val lanName = dub["lanName"]?.asText()
-                            if (dubSubjectId != null && lanName != null) {
-                                if (dubSubjectId == originalSubjectId) {
-                                    originalLanguageName = lanName
-                                } else {
-                                    subjectIds.add(Pair(dubSubjectId, lanName))
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            
-            // Always add the original subject ID first as the default source with proper language name
-            subjectIds.add(0, Pair(originalSubjectId, originalLanguageName))
-            
-            var hasAnyLinks = false
-            
-            // Process each subjectId (including dubs)
-            for ((subjectId, language) in subjectIds) {
-                var emittedFromPlayInfo = false
-                var activeBaseUrl = mainUrl
-                try {
-                    val (resolvedBaseUrl, response) = signedGetWithFallback(
-                        "/wefeed-mobile-bff/subject-api/play-info?subjectId=$subjectId&se=$season&ep=$episode",
-                        includePlayMode = true
-                    )
-                    activeBaseUrl = resolvedBaseUrl
-                    if (response.code == 200) {
-                        val responseBody = response.text
-                        if (responseBody.isNotBlank()) {
-                            val root = mapper.readTree(responseBody)
-                            val playData = root["data"]
-                            // Handle the new API response format with streams
-                            val streams = playData?.get("streams")
-                            if (streams != null && streams.isArray) {
-                                for (stream in streams) {
-                                    val streamUrl = stream["url"]?.asText() ?: continue
-                                    val format = stream["format"]?.asText() ?: ""
-                                    val resolutions = stream["resolutions"]?.asText() ?: ""
-                                    val signCookieRaw = stream["signCookie"]?.asText()
-                                    val signCookie = if (signCookieRaw.isNullOrEmpty()) null else signCookieRaw
-                                    val codecName = stream["codecName"]?.asText() ?: ""
-                                    val id = stream["id"]?.asText() ?: "$subjectId|$season|$episode"
-
-                                    Log.d("MBX", "=== STREAM LINK ===")
-                                    Log.d("MBX", "URL: $streamUrl")
-                                    Log.d("MBX", "Format: $format")
-                                    Log.d("MBX", "Resolution: $resolutions")
-                                    Log.d("MBX", "Codec: $codecName")
-                                    Log.d("MBX", "SignCookie: $signCookie")
-                                    Log.d("MBX", "isM3u8: ${format.equals("HLS", true) || streamUrl.contains(".m3u8", true) || streamUrl.contains("m3u8", true)}")
-                                    Log.d("MBX", "===================")
-
-                                    val emitted = emitLink(
-                                        sourceName = format,
-                                        streamUrl = streamUrl,
-                                        language = language,
-                                        resolution = resolutions,
-                                        refererBase = activeBaseUrl,
-                                        signCookie = signCookie
-                                    )
-                                    if (emitted) {
-                                        hasAnyLinks = true
-                                        emittedFromPlayInfo = true
-                                    }
-
-                                    val (_, subResponse) = signedGetWithFallback(
-                                        "/wefeed-mobile-bff/subject-api/get-stream-captions?subjectId=$subjectId&streamId=$id"
-                                    )
-                                    if (subResponse.code == 200) {
-                                        val subResponseBody = subResponse.text
-                                        if (!subResponseBody.isNullOrBlank()) {
-                                            val subRoot = mapper.readTree(subResponseBody)
-                                            val extCaptions = subRoot["data"]?.get("extCaptions")
-                                            if (extCaptions != null && extCaptions.isArray) {
-                                                for (caption in extCaptions) {
-                                                    val captionUrl = caption["url"]?.asText() ?: continue
-                                                    val lang = caption["language"]?.asText()
-                                                        ?: caption["lanName"]?.asText()
-                                                        ?: caption["lan"]?.asText()
-                                                        ?: "Unknown"
-                                                    subtitleCallback.invoke(
-                                                        SubtitleFile(
-                                                            url = captionUrl,
-                                                            lang = "$lang ($language - $resolutions)"
-                                                        )
-                                                    )
-                                                }
-                                            }
-                                        }
-                                    }
-                                        
-
-                                    val (_, subResponse1) = signedGetWithFallback(
-                                        "/wefeed-mobile-bff/subject-api/get-ext-captions?subjectId=$subjectId&resourceId=$id&episode=$episode"
-                                    )
-                            
-                                        if (subResponse1.code == 200) {
-                                            val subResponseBody1 = subResponse1.text
-                                            if (!subResponseBody1.isNullOrBlank()) {
-                                            val subRoot = mapper.readTree(subResponseBody1)
-                                            val extCaptions = subRoot["data"]?.get("extCaptions")
-                                            if (extCaptions != null && extCaptions.isArray) {
-                                                for (caption in extCaptions) {
-                                                    val captionUrl = caption["url"]?.asText() ?: continue
-                                                    val lang = caption["lan"]?.asText()
-                                                        ?: caption["lanName"]?.asText()
-                                                        ?: caption["language"]?.asText()
-                                                        ?: "Unknown"
-                                                    subtitleCallback.invoke(
-                                                        SubtitleFile(
-                                                            url = captionUrl,
-                                                            lang = "$lang ($language - $resolutions)"
-                                                        )
-                                                    )
-                                                }
-                                            }
-                                            }
-                                        }
-                                    
-                                }
-                            }
-
-                                if (!emittedFromPlayInfo) {
-                                    val fallbackFromSubject = extractFallbackLinksFromSubject(
-                                        subjectData = playData,
-                                        language = language,
-                                        refererBase = activeBaseUrl
-                                    )
-                                    if (fallbackFromSubject) {
-                                        hasAnyLinks = true
-                                    }
-                                }
-                        }
-                    }
-
-                } catch (e: Exception) {
-                    // Continue to resource fallback using the last known active base.
-                }
-
-                if (!emittedFromPlayInfo) {
-                    val (_, resourceResponse) = signedGetWithFallback(
-                        "/wefeed-mobile-bff/subject-api/resource?subjectId=$subjectId&page=1&perPage=8&all=0&startPosition=1&endPosition=1&pagerMode=0&resolution=0&se=$season&epFrom=$episode&epTo=$episode",
-                        includePlayMode = true
-                    )
-                    if (resourceResponse.code == 200) {
-                        val resourceBody = resourceResponse.text
-                        if (!resourceBody.isNullOrBlank()) {
-                            val resourceRoot = mapper.readTree(resourceBody)
-                            val resourceData = resourceRoot["data"]
-                            val fallbackFromResource = extractFallbackLinksFromSubject(
-                                subjectData = resourceData,
-                                language = language,
-                                refererBase = activeBaseUrl
-                            )
-                            if (fallbackFromResource) {
-                                hasAnyLinks = true
-                            }
-                        }
-                    }
-                }
-            }
-            
-            return hasAnyLinks
-              
-        } catch (e: Exception) {
-            return false
+        val parts = data.split("|")
+        val subjectId = when {
+            parts[0].contains("get?subjectId") ->
+                Uri.parse(parts[0]).getQueryParameter("subjectId") ?: parts[0]
+            parts[0].contains("/") -> parts[0].substringAfterLast('/')
+            else -> parts[0]
         }
+        val season = (if (parts.size > 1) parts[1].toIntOrNull() ?: 0 else 0).coerceAtLeast(1)
+        val episode = (if (parts.size > 2) parts[2].toIntOrNull() ?: 0 else 0).coerceAtLeast(1)
+
+        val playPath = "/wefeed-mobile-bff/subject-api/play-info?subjectId=$subjectId&se=$season&ep=$episode"
+        val fullUrl = "$mainUrl$playPath"
+
+        val ts = System.currentTimeMillis()
+        val headers = mapOf(
+            "User-Agent" to userAgentHeader,
+            "Accept" to "application/json",
+            "Content-Type" to "application/json",
+            "Connection" to "keep-alive",
+            "X-Client-Token" to generateXClientToken(ts),
+            "x-tr-signature" to generateXTrSignature(
+                "GET", "application/json", "application/json",
+                fullUrl, null, false, ts
+            ),
+            "X-Client-Info" to clientInfoHeader,
+            "X-Client-Status" to "0",
+            "X-Play-Mode" to "2"
+        )
+
+        val resp = app.get(fullUrl, headers = headers)
+
+        throw ErrorLoadingException(
+            "CODE:${resp.code}|URL:$fullUrl|BODY:${resp.text.take(500)}"
+        )
     }
 
     private suspend fun debugPlayInfoProbe(subjectId: String, season: Int, episode: Int) {
