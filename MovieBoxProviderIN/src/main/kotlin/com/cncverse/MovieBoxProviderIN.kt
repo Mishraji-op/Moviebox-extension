@@ -535,6 +535,13 @@ class MovieBoxProviderIN : MainAPI() {
                 var extracted = false
                 runCatching {
                     loadExtractor(cleanUrl, mainUrl, subtitleCallback) { link ->
+                        if (isSeriesRequest && (
+                                link.url.contains("/media/vone/", true) ||
+                                link.url.contains("-ld.mp4", true) ||
+                                link.url.contains("/trailer/", true)
+                            )) {
+                            return@loadExtractor
+                        }
                         callback(link)
                         extracted = true
                     }
@@ -620,13 +627,14 @@ class MovieBoxProviderIN : MainAPI() {
                     }
                 }
 
-                // Generic detail/trailer URLs are not episode-specific and can cause short clip playback for series.
-                if (!isSeriesRequest) {
-                    val detailPage = dataNode?.get("detailUrl")?.asText()?.takeIf { it.isNotBlank() }
-                    if (!detailPage.isNullOrBlank()) {
-                        if (emit(detailPage, "Page")) hasLinks = true
-                    }
+                // Try scraping the official detail page through extractors for additional source discovery.
+                val detailPage = dataNode?.get("detailUrl")?.asText()?.takeIf { it.isNotBlank() }
+                if (!detailPage.isNullOrBlank()) {
+                    if (emit(detailPage, "Page")) hasLinks = true
+                }
 
+                // Trailer fallback is useful for movies but must be avoided for series episodes.
+                if (!isSeriesRequest) {
                     val trailerUrl = dataNode?.get("trailer")?.get("VideoAddress")?.get("url")?.asText()
                         ?.takeIf { it.isNotBlank() }
                     if (!trailerUrl.isNullOrBlank()) {
