@@ -1,0 +1,63 @@
+name: Publish Builds
+
+concurrency:
+  group: publish-builds
+  cancel-in-progress: true
+
+on:
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - "*.md"
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          path: src
+
+      - name: Checkout builds branch
+        uses: actions/checkout@v4
+        with:
+          ref: builds
+          path: builds
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Build plugin and metadata
+        run: |
+          cd "$GITHUB_WORKSPACE/src"
+          echo "sdk.dir=${ANDROID_HOME}" > local.properties
+          chmod +x ./gradlew
+          ./gradlew MovieBoxProviderIN:make makePluginsJson --stacktrace --no-daemon
+
+      - name: Publish artifacts to builds branch
+        run: |
+          rm -f "$GITHUB_WORKSPACE/builds"/*.cs3
+          cp "$GITHUB_WORKSPACE/src"/MovieBoxProviderIN/build/*.cs3 "$GITHUB_WORKSPACE/builds/"
+          cp "$GITHUB_WORKSPACE/src"/build/plugins.json "$GITHUB_WORKSPACE/builds/plugins.json"
+          cp "$GITHUB_WORKSPACE/src"/build/plugins.json "$GITHUB_WORKSPACE/builds/MovieBoxProviderIN.json"
+
+      - name: Commit and push builds
+        run: |
+          cd "$GITHUB_WORKSPACE/builds"
+          git config user.email "actions@github.com"
+          git config user.name "GitHub Actions"
+          git add .
+          git commit -m "Build ${GITHUB_SHA}" || exit 0
+          git push
