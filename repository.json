@@ -1,0 +1,8 @@
+{
+  "name": "Moviebox-extension",
+  "description": "MovieBox IN extension repository",
+  "manifestVersion": 1,
+  "pluginLists": [
+    "https://raw.githubusercontent.com/Mishraji-op/Moviebox-extension/builds/plugins.json"
+  ]
+}
