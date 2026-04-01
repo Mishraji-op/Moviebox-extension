@@ -376,6 +376,7 @@ class MovieBoxProviderIN : MainAPI() {
                                         this.name = "S${se}E${ep}"
                                         this.season = se
                                         this.episode = ep
+                                        this.posterUrl = coverUrl
                                     }
                                 )
                             }
@@ -390,6 +391,7 @@ class MovieBoxProviderIN : MainAPI() {
                     this.name = "Episode 1"
                     this.season = 1
                     this.episode = 1
+                    this.posterUrl = coverUrl
                 })
             }
 
