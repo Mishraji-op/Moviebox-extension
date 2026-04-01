@@ -13,7 +13,6 @@ import javax.crypto.Mac
 import javax.crypto.spec.SecretKeySpec
 import java.security.MessageDigest
 import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
-import com.fasterxml.jackson.module.kotlin.readValue
 import com.fasterxml.jackson.databind.JsonNode
 
 class MovieBoxProviderIN : MainAPI() {
@@ -62,13 +61,14 @@ class MovieBoxProviderIN : MainAPI() {
         body: String? = null,
         includePlayMode: Boolean = false
     ): Map<String, String> {
+        val timestamp = System.currentTimeMillis()
         val headers = mutableMapOf(
             "User-Agent" to userAgentHeader,
             "Accept" to accept,
             "Content-Type" to contentType,
             "Connection" to "keep-alive",
-            "X-Client-Token" to generateXClientToken(),
-            "x-tr-signature" to generateXTrSignature(method, accept, contentType, url, body),
+            "X-Client-Token" to generateXClientToken(timestamp),
+            "x-tr-signature" to generateXTrSignature(method, accept, contentType, url, body, false, timestamp),
             "X-Client-Info" to clientInfoHeader,
             "X-Client-Status" to "0"
         )
@@ -201,7 +201,7 @@ class MovieBoxProviderIN : MainAPI() {
             pathAndQuery = "/wefeed-mobile-bff/tab-operating?page=1&tabId=0&version=",
             includePlayMode = true
         )
-        val responseBody = response.body?.string() ?: ""
+        val responseBody = response.text
 
         // Helper function to parse a 'subject' JSON object into your app's data model.
         fun parseSubject(subjectJson: JsonNode?): SearchResponse? {
@@ -263,8 +263,7 @@ class MovieBoxProviderIN : MainAPI() {
         val path = "/wefeed-mobile-bff/subject-api/search/v2"
         val jsonBody = """{"page": 1, "perPage": 10, "keyword": "$query"}"""
         val (_, response) = signedPostWithFallback(pathAndQuery = path, body = jsonBody)
-        val responseCode = response.code
-        val responseBody = response.body.string()  
+        val responseBody = response.text
         val mapper = jacksonObjectMapper()
         val root = mapper.readTree(responseBody)
         val results = root["data"]?.get("results") ?: return emptyList()
@@ -307,9 +306,9 @@ class MovieBoxProviderIN : MainAPI() {
         )
         val finalUrl = "$activeBaseUrl/wefeed-mobile-bff/subject-api/get?subjectId=$id"
         if (response.code != 200) {
-            throw ErrorLoadingException("Failed to load data: ${response.body?.string()}")
+            throw ErrorLoadingException("Failed to load data: ${response.text}")
         }
-        val responseBody = response.body?.string() ?: throw ErrorLoadingException("Empty response body")
+        val responseBody = response.text.ifBlank { throw ErrorLoadingException("Empty response body") }
         val mapper = jacksonObjectMapper()
         val root = mapper.readTree(responseBody)
         val data = root["data"] ?: throw ErrorLoadingException("No data in response")
@@ -368,7 +367,7 @@ class MovieBoxProviderIN : MainAPI() {
             val episodes = mutableListOf<Episode>()
             
             if (seasonResponse.code == 200) {
-                val seasonResponseBody = seasonResponse.body?.string()
+                val seasonResponseBody = seasonResponse.text
                 if (seasonResponseBody != null) {
                     val seasonRoot = mapper.readTree(seasonResponseBody)
                     val seasonData = seasonRoot["data"]
@@ -552,7 +551,7 @@ class MovieBoxProviderIN : MainAPI() {
             }
 
             if (subjectResponse.code == 200) {
-                val subjectResponseBody = subjectResponse.body?.string()
+                val subjectResponseBody = subjectResponse.text
                 if (subjectResponseBody != null) {
                     val subjectRoot = mapper.readTree(subjectResponseBody)
                     val subjectData = subjectRoot["data"]
@@ -583,11 +582,11 @@ class MovieBoxProviderIN : MainAPI() {
                 try {
                     var emittedFromPlayInfo = false
                     val (activeBaseUrl, response) = signedGetWithFallback(
-                        "/wefeed-mobile-bff/subject-api/play-info?subjectId=$subjectId&se=$season&ep=$episode&host=$mainUrl",
+                        "/wefeed-mobile-bff/subject-api/play-info?subjectId=$subjectId&se=$season&ep=$episode",
                         includePlayMode = true
                     )
                     if (response.code == 200) {
-                        val responseBody = response.body?.string()
+                        val responseBody = response.text
                         if (responseBody != null) {
                             val root = mapper.readTree(responseBody)
                             val playData = root["data"]
@@ -613,12 +612,10 @@ class MovieBoxProviderIN : MainAPI() {
                                     emittedFromPlayInfo = true
 
                                     val (_, subResponse) = signedGetWithFallback(
-                                        "/wefeed-mobile-bff/subject-api/get-stream-captions?subjectId=$subjectId&streamId=$id&host=$activeBaseUrl",
-                                        accept = "",
-                                        contentType = ""
+                                        "/wefeed-mobile-bff/subject-api/get-stream-captions?subjectId=$subjectId&streamId=$id"
                                     )
                                     if (subResponse.code == 200) {
-                                        val subResponseBody = subResponse.body?.string()
+                                        val subResponseBody = subResponse.text
                                         if (!subResponseBody.isNullOrBlank()) {
                                             val subRoot = mapper.readTree(subResponseBody)
                                             val extCaptions = subRoot["data"]?.get("extCaptions")
@@ -642,13 +639,11 @@ class MovieBoxProviderIN : MainAPI() {
                                         
 
                                     val (_, subResponse1) = signedGetWithFallback(
-                                                                                "/wefeed-mobile-bff/subject-api/get-ext-captions?subjectId=$subjectId&resourceId=$id&episode=$episode&host=$activeBaseUrl",
-                                        accept = "",
-                                        contentType = ""
+                                        "/wefeed-mobile-bff/subject-api/get-ext-captions?subjectId=$subjectId&resourceId=$id&episode=$episode"
                                     )
                             
                                         if (subResponse1.code == 200) {
-                                            val subResponseBody1 = subResponse1.body?.string()
+                                            val subResponseBody1 = subResponse1.text
                                             if (!subResponseBody1.isNullOrBlank()) {
                                             val subRoot = mapper.readTree(subResponseBody1)
                                             val extCaptions = subRoot["data"]?.get("extCaptions")
@@ -688,11 +683,11 @@ class MovieBoxProviderIN : MainAPI() {
 
                         if (!emittedFromPlayInfo) {
                             val (_, resourceResponse) = signedGetWithFallback(
-                                "/wefeed-mobile-bff/subject-api/resource?subjectId=$subjectId&page=1&perPage=8&all=0&startPosition=1&endPosition=1&pagerMode=0&resolution=0&se=$season&epFrom=$episode&epTo=$episode&host=$activeBaseUrl",
+                                "/wefeed-mobile-bff/subject-api/resource?subjectId=$subjectId&page=1&perPage=8&all=0&startPosition=1&endPosition=1&pagerMode=0&resolution=0&se=$season&epFrom=$episode&epTo=$episode",
                                 includePlayMode = true
                             )
                             if (resourceResponse.code == 200) {
-                                val resourceBody = resourceResponse.body?.string()
+                                val resourceBody = resourceResponse.text
                                 if (!resourceBody.isNullOrBlank()) {
                                     val resourceRoot = mapper.readTree(resourceBody)
                                     val resourceData = resourceRoot["data"]
