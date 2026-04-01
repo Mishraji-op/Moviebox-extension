@@ -298,134 +298,113 @@ class MovieBoxProviderIN : MainAPI() {
     }
 
     override suspend fun load(url: String): LoadResponse? {
-        val id = if (url.contains("get?subjectId")) {
-            Uri.parse(url).getQueryParameter("subjectId") ?: url.substringAfterLast('/')
-        } else {
-            url.substringAfterLast('/')
+        val id = when {
+            url.contains("get?subjectId") -> Uri.parse(url).getQueryParameter("subjectId") ?: url
+            url.contains("/") -> url.substringAfterLast('/')
+            else -> url
         }
-        val (activeBaseUrl, response) = signedGetWithFallback(
-            pathAndQuery = "/wefeed-mobile-bff/subject-api/get?subjectId=$id",
-            includePlayMode = true
+
+        val path = "/wefeed-mobile-bff/subject-api/get?subjectId=$id"
+        val fullUrl = "$mainUrl$path"
+        val ts = System.currentTimeMillis()
+
+        val headers = mapOf(
+            "User-Agent" to userAgentHeader,
+            "Accept" to "application/json",
+            "Content-Type" to "application/json",
+            "Connection" to "keep-alive",
+            "X-Client-Token" to generateXClientToken(ts),
+            "x-tr-signature" to generateXTrSignature(
+                "GET", "application/json", "application/json",
+                fullUrl, null, false, ts
+            ),
+            "X-Client-Info" to clientInfoHeader,
+            "X-Client-Status" to "0"
         )
-        val finalUrl = "$activeBaseUrl/wefeed-mobile-bff/subject-api/get?subjectId=$id"
-        if (response.code != 200) {
-            throw ErrorLoadingException("Failed to load data: ${response.text}")
-        }
-        val responseBody = response.text.ifBlank { throw ErrorLoadingException("Empty response body") }
+
+        val response = app.get(fullUrl, headers = headers)
+        val responseBody = response.text
+        if (responseBody.isBlank()) throw ErrorLoadingException("Empty response")
+
         val mapper = jacksonObjectMapper()
         val root = mapper.readTree(responseBody)
-        val data = root["data"] ?: throw ErrorLoadingException("No data in response")
+        val data = root["data"] ?: throw ErrorLoadingException("No data")
 
-        val title = data["title"]?.asText() ?: throw ErrorLoadingException("No title found")
+        val title = data["title"]?.asText() ?: "Unknown"
         val description = data["description"]?.asText()
-        val releaseDate = data["releaseDate"]?.asText()
-        val duration = data["duration"]?.asText()
-        val genre = data["genre"]?.asText()
-        val imdbRating = data["imdbRatingValue"]?.asText()?.toDoubleOrNull()?.times(10)?.toInt()
-        val year = releaseDate?.substring(0, 4)?.toIntOrNull()
         val coverUrl = data["cover"]?.get("url")?.asText()
-        val backgroundUrl = data["cover"]?.get("url")?.asText()
         val subjectType = data["subjectType"]?.asInt() ?: 1
-        val countryName = data["countryName"]?.asText()
-
-        // Parse cast information
-        val actors = data["staffList"]?.mapNotNull { staff ->
-            val staffType = staff["staffType"]?.asInt()
-            if (staffType == 1) { // Actor
-                val name = staff["name"]?.asText() ?: return@mapNotNull null
-                val character = staff["character"]?.asText()
-                val avatarUrl = staff["avatarUrl"]?.asText()
-                ActorData(
-                    Actor(name, avatarUrl),
-                    roleString = character
-                )
-            } else null
-        } ?: emptyList()
-
-        // Parse tags/genres
+        val releaseDate = data["releaseDate"]?.asText()
+        val year = try { releaseDate?.substring(0, 4)?.toIntOrNull() } catch (_: Exception) { null }
+        val genre = data["genre"]?.asText()
         val tags = genre?.split(",")?.map { it.trim() } ?: emptyList()
 
-        // Parse duration to minutes
-        val durationMinutes = duration?.let { dur ->
-            val regex = """(\d+)h\s*(\d+)m""".toRegex()
-            val match = regex.find(dur)
-            if (match != null) {
-                val hours = match.groupValues[1].toIntOrNull() ?: 0
-                val minutes = match.groupValues[2].toIntOrNull() ?: 0
-                hours * 60 + minutes
-            } else {
-                dur.replace("m", "").toIntOrNull()
-            }
-        }
-
-        val type = when (subjectType) {
-            1 -> TvType.Movie
-            2 -> TvType.TvSeries
-            else -> TvType.Movie
-        }
+        val type = if (subjectType == 2) TvType.TvSeries else TvType.Movie
 
         if (type == TvType.TvSeries) {
-            // For TV series, get season and episode information
-            val (_, seasonResponse) = signedGetWithFallback("/wefeed-mobile-bff/subject-api/season-info?subjectId=$id")
+            val seasonPath = "/wefeed-mobile-bff/subject-api/season-info?subjectId=$id"
+            val seasonUrl = "$mainUrl$seasonPath"
+            val ts2 = System.currentTimeMillis()
+            val seasonHeaders = mapOf(
+                "User-Agent" to userAgentHeader,
+                "Accept" to "application/json",
+                "Content-Type" to "application/json",
+                "Connection" to "keep-alive",
+                "X-Client-Token" to generateXClientToken(ts2),
+                "x-tr-signature" to generateXTrSignature(
+                    "GET", "application/json", "application/json",
+                    seasonUrl, null, false, ts2
+                ),
+                "X-Client-Info" to clientInfoHeader,
+                "X-Client-Status" to "0"
+            )
+
             val episodes = mutableListOf<Episode>()
-            
-            if (seasonResponse.code == 200) {
-                val seasonResponseBody = seasonResponse.text
-                if (seasonResponseBody != null) {
-                    val seasonRoot = mapper.readTree(seasonResponseBody)
-                    val seasonData = seasonRoot["data"]
-                    val seasons = seasonData?.get("seasons")
-                    
-                    seasons?.forEach { season ->
-                        val seasonNumber = season["se"]?.asInt() ?: 1
-                        val maxEpisodes = season["maxEp"]?.asInt() ?: 1
-                        for (episodeNumber in 1..maxEpisodes) {
-                            episodes.add(
-                                newEpisode("$id|$seasonNumber|$episodeNumber") {
-                                    this.name = "S${seasonNumber}E${episodeNumber}"
-                                    this.season = seasonNumber
-                                    this.episode = episodeNumber
-                                    this.posterUrl = coverUrl
-                                    this.description = "Season $seasonNumber Episode $episodeNumber"
-                                }
-                            )
+            try {
+                val seasonResp = app.get(seasonUrl, headers = seasonHeaders)
+                if (seasonResp.code == 200) {
+                    val seasonBody = seasonResp.text
+                    if (seasonBody.isNotBlank()) {
+                        val seasonRoot = mapper.readTree(seasonBody)
+                        val seasons = seasonRoot["data"]?.get("seasons")
+                        seasons?.forEach { season ->
+                            val se = season["se"]?.asInt() ?: 1
+                            val maxEp = season["maxEp"]?.asInt() ?: 1
+                            for (ep in 1..maxEp) {
+                                episodes.add(
+                                    newEpisode("$id|$se|$ep") {
+                                        this.name = "S${se}E${ep}"
+                                        this.season = se
+                                        this.episode = ep
+                                    }
+                                )
+                            }
                         }
                     }
                 }
+            } catch (_: Exception) {
             }
-            
-            // If no episodes were found, add a fallback episode
+
             if (episodes.isEmpty()) {
-                episodes.add(
-                    newEpisode("$id|1|1") {
-                        this.name = "Episode 1"
-                        this.season = 1
-                        this.episode = 1
-                        this.posterUrl = coverUrl
-                    }
-                )
+                episodes.add(newEpisode("$id|1|1") {
+                    this.name = "Episode 1"
+                    this.season = 1
+                    this.episode = 1
+                })
             }
-            
-            return newTvSeriesLoadResponse(title, finalUrl, type, episodes) {
+
+            return newTvSeriesLoadResponse(title, url, type, episodes) {
                 this.posterUrl = coverUrl
-                this.backgroundPosterUrl = backgroundUrl
                 this.plot = description
                 this.year = year
                 this.tags = tags
-                this.actors = actors
-                this.score = imdbRating?.let { Score.from10(it.toDouble()) }
-                this.duration = durationMinutes
             }
         } else {
-            return newMovieLoadResponse(title, finalUrl, type, id) {
+            return newMovieLoadResponse(title, url, type, id) {
                 this.posterUrl = coverUrl
-                this.backgroundPosterUrl = backgroundUrl
                 this.plot = description
                 this.year = year
                 this.tags = tags
-                this.actors = actors
-                this.score = imdbRating?.let { Score.from10(it.toDouble()) }
-                this.duration = durationMinutes
             }
         }
     }
@@ -438,8 +417,7 @@ class MovieBoxProviderIN : MainAPI() {
     ): Boolean {
         val parts = data.split("|")
         val subjectId = when {
-            parts[0].contains("get?subjectId") ->
-                Uri.parse(parts[0]).getQueryParameter("subjectId") ?: parts[0]
+            parts[0].contains("get?subjectId") -> Uri.parse(parts[0]).getQueryParameter("subjectId") ?: parts[0]
             parts[0].contains("/") -> parts[0].substringAfterLast('/')
             else -> parts[0]
         }
@@ -448,8 +426,8 @@ class MovieBoxProviderIN : MainAPI() {
 
         val playPath = "/wefeed-mobile-bff/subject-api/play-info?subjectId=$subjectId&se=$season&ep=$episode"
         val fullUrl = "$mainUrl$playPath"
-
         val ts = System.currentTimeMillis()
+
         val headers = mapOf(
             "User-Agent" to userAgentHeader,
             "Accept" to "application/json",
@@ -466,10 +444,49 @@ class MovieBoxProviderIN : MainAPI() {
         )
 
         val resp = app.get(fullUrl, headers = headers)
+        val body = resp.text
+        if (body.isBlank()) return false
 
-        throw ErrorLoadingException(
-            "CODE:${resp.code}|URL:$fullUrl|BODY:${resp.text.take(500)}"
-        )
+        val mapper = jacksonObjectMapper()
+        val root = mapper.readTree(body)
+        val playData = root["data"] ?: return false
+        val streams = playData["streams"] ?: return false
+
+        var hasLinks = false
+        if (streams.isArray) {
+            for (stream in streams) {
+                val streamUrl = stream["url"]?.asText() ?: continue
+                if (streamUrl.isBlank()) continue
+
+                val format = stream["format"]?.asText() ?: ""
+                val res = stream["resolutions"]?.asText() ?: ""
+                val cookie = stream["signCookie"]?.asText()?.takeIf { it.isNotBlank() }
+
+                callback.invoke(
+                    newExtractorLink(
+                        source = this.name,
+                        name = "${this.name} ($res)",
+                        url = streamUrl,
+                        type = if (format.equals("HLS", true) || streamUrl.contains(".m3u8", true)) {
+                            ExtractorLinkType.M3U8
+                        } else {
+                            ExtractorLinkType.VIDEO
+                        }
+                    ) {
+                        this.quality = Qualities.Unknown.value
+                        this.headers = mutableMapOf(
+                            "User-Agent" to userAgentHeader,
+                            "Referer" to mainUrl
+                        ).apply {
+                            if (cookie != null) put("Cookie", cookie)
+                        }
+                    }
+                )
+                hasLinks = true
+            }
+        }
+
+        return hasLinks
     }
 
     private suspend fun debugPlayInfoProbe(subjectId: String, season: Int, episode: Int) {
