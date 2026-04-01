@@ -20,6 +20,13 @@ jobs:
           distribution: temurin
           java-version: '17'
 
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Create local.properties
+        run: |
+          echo "sdk.dir=${ANDROID_HOME}" > local.properties
+
       - name: Validate Gradle wrapper presence
         run: |
           if [ ! -f "./gradlew" ]; then
@@ -28,7 +35,7 @@ jobs:
             exit 1
           fi
 
-      - name: Build
+      - name: Build Plugin
         run: |
           chmod +x ./gradlew
-          ./gradlew build --stacktrace --no-daemon
+          ./gradlew MovieBoxProviderIN:make --stacktrace --no-daemon
