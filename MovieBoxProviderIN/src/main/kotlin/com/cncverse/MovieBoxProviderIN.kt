@@ -480,41 +480,59 @@ class MovieBoxProviderIN : MainAPI() {
                 resolution: String,
                 refererBase: String,
                 signCookie: String? = null
-            ) {
-                if (streamUrl.isBlank() || !visitedUrls.add(streamUrl)) return
+            ): Boolean {
+                if (streamUrl.isBlank() || !visitedUrls.add(streamUrl)) return false
                 if (streamUrl.startsWith("magnet:", ignoreCase = true) || streamUrl.endsWith(".torrent", ignoreCase = true)) {
                     Log.d("MBX", "Skipping non-playable stream URL: ${streamUrl.take(120)}")
-                    return
+                    return false
                 }
 
                 val isHls = sourceName.equals("HLS", ignoreCase = true)
                     || streamUrl.contains(".m3u8", ignoreCase = true)
                     || streamUrl.contains("m3u8", ignoreCase = true)
+                    || streamUrl.contains("/hls/", ignoreCase = true)
+                val isDash = sourceName.equals("DASH", ignoreCase = true)
+                    || streamUrl.contains(".mpd", ignoreCase = true)
+
+                val streamHeaders = mutableMapOf(
+                    "User-Agent" to userAgentHeader,
+                    "Referer" to refererBase,
+                    "Origin" to refererBase,
+                    "Accept" to "*/*",
+                    "Connection" to "keep-alive"
+                )
+                if (!signCookie.isNullOrBlank()) {
+                    streamHeaders["Cookie"] = signCookie
+                }
+
+                val actualUrl = if (streamUrl.contains("redirect", ignoreCase = true) || (!isHls && !isDash)) {
+                    try {
+                        val redirectResp = app.get(streamUrl, headers = streamHeaders, allowRedirects = false)
+                        redirectResp.headers["Location"] ?: streamUrl
+                    } catch (_: Exception) {
+                        streamUrl
+                    }
+                } else {
+                    streamUrl
+                }
 
                 callback.invoke(
                     newExtractorLink(
-                        source = name,
-                        name = if (resolution.isNotBlank()) "$name ($language - $resolution)" else "$name ($language)",
-                        url = streamUrl,
+                        source = this.name,
+                        name = if (resolution.isNotBlank()) "${this.name} ($language - $resolution)" else "${this.name} ($language)",
+                        url = actualUrl,
                         type = when {
-                            streamUrl.substringAfterLast('.', "").equals("mpd", ignoreCase = true) -> ExtractorLinkType.DASH
+                            isDash -> ExtractorLinkType.DASH
                             isHls -> ExtractorLinkType.M3U8
                             else -> ExtractorLinkType.VIDEO
                         }
                     ) {
-                        this.headers = mapOf(
-                            "User-Agent" to userAgentHeader,
-                            "Referer" to refererBase,
-                            "Origin" to refererBase,
-                            "Accept" to "*/*",
-                            "Connection" to "keep-alive"
-                        )
+                        this.headers = streamHeaders
                         this.quality = qualityFromResolution(resolution)
-                        if (!signCookie.isNullOrBlank()) {
-                            this.headers = this.headers + mapOf("Cookie" to signCookie)
-                        }
                     }
                 )
+                Log.d("MBX", "Actual URL: $actualUrl")
+                return true
             }
 
             suspend fun extractFallbackLinksFromSubject(
@@ -634,17 +652,19 @@ class MovieBoxProviderIN : MainAPI() {
                                     val resolutions = stream["resolutions"]?.asText() ?: ""
                                     val signCookieRaw = stream["signCookie"]?.asText()
                                     val signCookie = if (signCookieRaw.isNullOrEmpty()) null else signCookieRaw
+                                    val codecName = stream["codecName"]?.asText() ?: ""
                                     val id = stream["id"]?.asText() ?: "$subjectId|$season|$episode"
 
                                     Log.d("MBX", "=== STREAM LINK ===")
                                     Log.d("MBX", "URL: $streamUrl")
                                     Log.d("MBX", "Format: $format")
                                     Log.d("MBX", "Resolution: $resolutions")
-                                    Log.d("MBX", "SignCookie: ${signCookie?.take(300)}")
+                                    Log.d("MBX", "Codec: $codecName")
+                                    Log.d("MBX", "SignCookie: $signCookie")
                                     Log.d("MBX", "isM3u8: ${format.equals("HLS", true) || streamUrl.contains(".m3u8", true) || streamUrl.contains("m3u8", true)}")
                                     Log.d("MBX", "===================")
 
-                                    emitLink(
+                                    val emitted = emitLink(
                                         sourceName = format,
                                         streamUrl = streamUrl,
                                         language = language,
@@ -652,8 +672,10 @@ class MovieBoxProviderIN : MainAPI() {
                                         refererBase = activeBaseUrl,
                                         signCookie = signCookie
                                     )
-                                    hasAnyLinks = true
-                                    emittedFromPlayInfo = true
+                                    if (emitted) {
+                                        hasAnyLinks = true
+                                        emittedFromPlayInfo = true
+                                    }
 
                                     val (_, subResponse) = signedGetWithFallback(
                                         "/wefeed-mobile-bff/subject-api/get-stream-captions?subjectId=$subjectId&streamId=$id"
