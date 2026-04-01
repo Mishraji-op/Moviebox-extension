@@ -474,23 +474,7 @@ class MovieBoxProviderIN : MainAPI() {
             return true
         }
 
-        if (body.isNotBlank()) {
-            val root = mapper.readTree(body)
-            val playData = root["data"]
-            val streams = playData?.get("streams")
-            if (streams != null && streams.isArray) {
-                for (stream in streams) {
-                    val streamUrl = stream["url"]?.asText() ?: continue
-                    val format = stream["format"]?.asText() ?: ""
-                    val res = stream["resolutions"]?.asText() ?: "Unknown"
-                    val cookie = stream["signCookie"]?.asText()?.takeIf { it.isNotBlank() }
-                    val chosenUrl = streamUrl
-                    val ok = emit(chosenUrl, if (format.isNotBlank()) "$res/$format" else res, cookie)
-                    if (ok) hasLinks = true
-                }
-            }
-        }
-
+        // Prefer direct resource links first: this avoids initial failing stream attempts.
         if (!hasLinks) {
             val detailsPath = "/wefeed-mobile-bff/subject-api/get?subjectId=$subjectId"
             val detailsUrl = "$mainUrl$detailsPath"
@@ -545,6 +529,26 @@ class MovieBoxProviderIN : MainAPI() {
                             }
                         }
                     }
+                }
+            }
+        }
+
+        if (hasLinks) return true
+
+        // Fallback to play-info streams only when direct resource links are unavailable.
+        if (body.isNotBlank()) {
+            val root = mapper.readTree(body)
+            val playData = root["data"]
+            val streams = playData?.get("streams")
+            if (streams != null && streams.isArray) {
+                for (stream in streams) {
+                    val streamUrl = stream["url"]?.asText() ?: continue
+                    val format = stream["format"]?.asText() ?: ""
+                    val res = stream["resolutions"]?.asText() ?: "Unknown"
+                    val cookie = stream["signCookie"]?.asText()?.takeIf { it.isNotBlank() }
+                    val chosenUrl = streamUrl
+                    val ok = emit(chosenUrl, if (format.isNotBlank()) "$res/$format" else res, cookie)
+                    if (ok) hasLinks = true
                 }
             }
         }
