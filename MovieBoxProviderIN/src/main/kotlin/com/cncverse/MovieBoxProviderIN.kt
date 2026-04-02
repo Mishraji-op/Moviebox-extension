@@ -36,6 +36,7 @@ class MovieBoxProviderIN : MainAPI() {
         ?: "Xqn2nnO41/L92o1iuXhSLHTbXvY4Z5ZZ62m8mSLA"
 
     private val authToken = System.getenv("MOVIEBOX_AUTH_TOKEN")?.takeIf { it.isNotBlank() }
+    private var runtimeAuthToken: String? = null
 
     private val hostPool = listOf(
         "https://api6.aoneroom.com",
@@ -116,6 +117,20 @@ class MovieBoxProviderIN : MainAPI() {
             .filter { it.length > 10 }
             .distinct()
             .toList()
+    }
+
+    private fun updateAuthTokenFromXUser(xUserHeader: String?) {
+        if (xUserHeader.isNullOrBlank()) return
+        runCatching {
+            val token = jacksonObjectMapper()
+                .readTree(xUserHeader)
+                ?.get("token")
+                ?.asText()
+                ?.takeIf { it.isNotBlank() }
+            if (!token.isNullOrBlank()) {
+                runtimeAuthToken = token
+            }
+        }
     }
 
     private fun collectUrlsFromJson(node: JsonNode?, out: MutableSet<String>) {
@@ -242,7 +257,7 @@ class MovieBoxProviderIN : MainAPI() {
             "X-Client-Info" to clientInfoHeader,
             "X-Client-Status" to "0"
         )
-        authToken?.let { headers["Authorization"] = "Bearer $it" }
+        (runtimeAuthToken ?: authToken)?.let { headers["Authorization"] = "Bearer $it" }
         if (includePlayMode) {
             headers["X-Play-Mode"] = "2"
         }
@@ -259,6 +274,7 @@ class MovieBoxProviderIN : MainAPI() {
         for (base in hostPool) {
             val url = "$base$pathAndQuery"
             val response = app.get(url, headers = buildSignedHeaders("GET", url, accept, contentType, null, includePlayMode))
+            updateAuthTokenFromXUser(response.headers["x-user"])
             last = Pair(base, response)
             if (!shouldRetryHost(response.code)) {
                 mainUrl = base
@@ -279,6 +295,7 @@ class MovieBoxProviderIN : MainAPI() {
         for (base in hostPool) {
             val url = "$base$pathAndQuery"
             val response = app.post(url, headers = buildSignedHeaders("POST", url, accept, contentType, body), requestBody = requestBody)
+            updateAuthTokenFromXUser(response.headers["x-user"])
             last = Pair(base, response)
             if (!shouldRetryHost(response.code)) {
                 mainUrl = base
@@ -610,8 +627,25 @@ class MovieBoxProviderIN : MainAPI() {
             parts[0].contains("/") -> parts[0].substringAfterLast('/')
             else -> parts[0]
         }
-        val season = (if (parts.size > 1) parts[1].toIntOrNull() ?: 0 else 0).coerceAtLeast(1)
-        val episode = (if (parts.size > 2) parts[2].toIntOrNull() ?: 0 else 0).coerceAtLeast(1)
+        val season = if (isSeriesRequest) {
+            (if (parts.size > 1) parts[1].toIntOrNull() ?: 1 else 1).coerceAtLeast(1)
+        } else {
+            0
+        }
+        val episode = if (isSeriesRequest) {
+            (if (parts.size > 2) parts[2].toIntOrNull() ?: 1 else 1).coerceAtLeast(1)
+        } else {
+            0
+        }
+
+        // Seed/refresh bearer token required by some protected stream responses.
+        runCatching {
+            val (_, subjectResp) = signedGetWithFallback(
+                pathAndQuery = "/wefeed-mobile-bff/subject-api/get?subjectId=$subjectId",
+                includePlayMode = true
+            )
+            updateAuthTokenFromXUser(subjectResp.headers["x-user"])
+        }
 
         val playPath = "/wefeed-mobile-bff/subject-api/play-info?subjectId=$subjectId&se=$season&ep=$episode"
         val fullUrl = "$mainUrl$playPath"
