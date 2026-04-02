@@ -51,6 +51,8 @@ class MovieBoxProviderIN : MainAPI() {
     private val clientInfoHeader = """{"package_name":"com.community.oneroom","version_name":"3.0.05.0711.03","version_code":50020052,"os":"android","os_version":"16","device_id":"da2b99c821e6ea023e4be55b54d5f7d8","install_store":"ps","gaid":"d7578036d13336cc","brand":"google","model":"sdk_gphone64_x86_64","system_language":"en","net":"NETWORK_WIFI","region":"IN","timezone":"Asia/Calcutta","sp_code":""}"""
     private val debugLoadLinks = false
     private val debugThrowInUi = false
+    private val webApiBase = "https://h5-api.aoneroom.com"
+    private val webUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
     private val blockedSourceHostKeywords = listOf(
         "fzmovies",
         "vegamovies",
@@ -99,6 +101,126 @@ class MovieBoxProviderIN : MainAPI() {
 
     private fun shouldRetryHost(code: Int): Boolean {
         return code == 403 || code == 407 || code == 429 || code == 500 || code == 502 || code == 503 || code == 504
+    }
+
+    private fun collectUrlsFromText(raw: String): List<String> {
+        if (raw.isBlank()) return emptyList()
+        val normalized = raw
+            .replace("\\/", "/")
+            .replace("\\u0026", "&")
+            .replace("&amp;", "&")
+
+        val regex = Regex("https?://[^\\s\"'<>]+", RegexOption.IGNORE_CASE)
+        return regex.findAll(normalized)
+            .map { it.value.trim().trimEnd(',', ';', ')', ']', '}') }
+            .filter { it.length > 10 }
+            .distinct()
+            .toList()
+    }
+
+    private fun collectUrlsFromJson(node: JsonNode?, out: MutableSet<String>) {
+        if (node == null || node.isNull) return
+        when {
+            node.isTextual -> {
+                collectUrlsFromText(node.asText()).forEach { out.add(it) }
+            }
+            node.isArray -> {
+                node.forEach { child -> collectUrlsFromJson(child, out) }
+            }
+            node.isObject -> {
+                node.fields().forEach { (_, value) -> collectUrlsFromJson(value, out) }
+            }
+        }
+    }
+
+    private fun seriesCandidateScore(url: String, season: Int, episode: Int): Int {
+        val text = url.lowercase()
+        val s2 = season.toString().padStart(2, '0')
+        val e2 = episode.toString().padStart(2, '0')
+        var score = 0
+
+        val strongMarkers = listOf(
+            "s${s2}e${e2}",
+            "s${season}e${episode}",
+            "season-$season-episode-$episode",
+            "season${season}episode${episode}",
+            "se=$season&ep=$episode",
+            "se=$season",
+            "ep=$episode"
+        )
+        if (strongMarkers.any { text.contains(it) }) score += 100
+
+        val mediumMarkers = listOf(
+            "season-$season",
+            "episode-$episode",
+            "/s${season}/e${episode}/",
+            "_${s2}${e2}",
+            "-${s2}${e2}-"
+        )
+        if (mediumMarkers.any { text.contains(it) }) score += 40
+
+        if (text.contains(".m3u8") || text.contains(".mp4") || text.contains("download")) score += 20
+        if (text.contains("trailer") || text.contains("teaser") || text.contains("clip")) score -= 200
+
+        return score
+    }
+
+    private suspend fun fetchWebCandidates(subjectId: String): List<String> {
+        val mapper = jacksonObjectMapper()
+        val urlSet = linkedSetOf<String>()
+
+        val baseHeaders = mutableMapOf(
+            "User-Agent" to webUserAgent,
+            "Accept" to "application/json, text/plain, */*",
+            "Referer" to "https://moviebox.ph/"
+        )
+
+        var xUser: String? = null
+        runCatching {
+            val homeUrl = "$webApiBase/wefeed-h5api-bff/page-api/home"
+            val homeResp = app.get(homeUrl, headers = baseHeaders)
+            xUser = homeResp.headers["x-user"]?.takeIf { it.isNotBlank() }
+            if (homeResp.text.isNotBlank()) {
+                val root = mapper.readTree(homeResp.text)
+                collectUrlsFromJson(root, urlSet)
+            }
+        }
+
+        val detailPaths = listOf(
+            "/wefeed-h5api-bff/page-api/subject/detail?subjectId=$subjectId",
+            "/wefeed-h5api-bff/page-api/subject/get?subjectId=$subjectId",
+            "/wefeed-h5api-bff/subject-api/get?subjectId=$subjectId"
+        )
+
+        for (path in detailPaths) {
+            runCatching {
+                val detailHeaders = baseHeaders.toMutableMap().apply {
+                    xUser?.let { this["x-user"] = it }
+                }
+                val resp = app.get("$webApiBase$path", headers = detailHeaders)
+                if (resp.text.isBlank()) return@runCatching
+
+                collectUrlsFromText(resp.text).forEach { urlSet.add(it) }
+
+                val root = mapper.readTree(resp.text)
+                collectUrlsFromJson(root, urlSet)
+            }
+        }
+
+        val scrapedPages = urlSet
+            .filter { it.contains("moviebox", true) && (it.contains("/movie/", true) || it.contains("/tv/", true) || it.contains("subjectId", true)) }
+            .take(4)
+
+        for (pageUrl in scrapedPages) {
+            runCatching {
+                val pageResp = app.get(pageUrl, headers = mapOf("User-Agent" to webUserAgent, "Referer" to "https://moviebox.ph/"))
+                if (pageResp.text.isNotBlank()) {
+                    collectUrlsFromText(pageResp.text).forEach { urlSet.add(it) }
+                }
+            }
+        }
+
+        return urlSet.toList()
     }
 
     private fun buildSignedHeaders(
@@ -711,6 +833,32 @@ class MovieBoxProviderIN : MainAPI() {
                         if (emit(link, res)) hasLinks = true
                     }
                 }
+            }
+        }
+
+        if (hasLinks) return true
+
+        // Last resort: scrape web API/detail payloads for hidden source URLs and pass them through emit/extractors.
+        val webCandidates = fetchWebCandidates(subjectId)
+        if (webCandidates.isNotEmpty()) {
+            val sorted = if (isSeriesRequest) {
+                webCandidates.sortedByDescending { seriesCandidateScore(it, season, episode) }
+            } else {
+                webCandidates.sortedByDescending {
+                    var score = 0
+                    val lower = it.lowercase()
+                    if (lower.contains(".m3u8") || lower.contains(".mp4") || lower.contains("download")) score += 40
+                    if (lower.contains("trailer") || lower.contains("teaser") || lower.contains("clip")) score -= 120
+                    score
+                }
+            }
+
+            for (candidate in sorted.take(40)) {
+                val lower = candidate.lowercase()
+                if (isSeriesRequest && (lower.contains("trailer") || lower.contains("teaser") || lower.contains("clip"))) {
+                    continue
+                }
+                if (emit(candidate, "WebFallback")) hasLinks = true
             }
         }
 
